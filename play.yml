@@ -1,0 +1,137 @@
+---
+    - hosts: localhost
+      remote_user: wasimali
+      vars:
+        - acme_challenge_type: http-01
+        - acme_directory: https://acme-v02.api.letsencrypt.org/directory
+        - acme_version: 2
+        - acme_email: wasim@trackier.com
+        - letsencrypt_dir: /home/{{ user.stdout }}/
+        - letsencrypt_keys_dir: /home/{{ user.stdout }}/keys
+        - letsencrypt_csrs_dir: /home/{{ user.stdout }}/csrs
+        - letsencrypt_certs_dir: /home/{{ user.stdout }}/certs
+        - letsencrypt_account_key: /home/{{ user.stdout }}/account/account.key
+        - domain_name: "{{ lookup('file','/home/{{ user.stdout }}/f4.txt') }}"
+        - contents: "{{ lookup('file','/home/{{ user.stdout }}/f3.txt') }}"
+        - removed_ssl: "{{ lookup('file','/home/{{ user.stdout }}/f5.txt') }}"
+        - user_input: "{{ lookup('file','/home/{{ user.stdout }}/user_input.txt') }}"
+        - proxy: "{{ lookup('file','/home/{{ user.stdout }}/proxy.txt') }}"
+
+
+      tasks:
+
+      - name: "User"
+        shell: "echo $(whoami)"
+        register: user
+
+      - name: "Create required directories in /home/user/"
+        file:
+          path: "/home/{{ user.stdout }}/{{ item }}"
+          state: directory
+          owner: "{{ user.stdout }}"
+          group: "{{ user.stdout }}"
+          mode: u=rwx,g=rwx,o=rwx
+        with_items:
+        - account
+        - certs
+        - csrs
+        - keys
+        become: yes
+
+      - name: "Generate a Let's Encrypt account key"
+        shell: "if [ ! -f {{ letsencrypt_account_key }} ]; then openssl genrsa 2048 | sudo tee {{ letsencrypt_account_key }}; fi"
+
+      - name: "Generate Let's Encrypt private key"
+        shell: "openssl genrsa 2048 | sudo tee /home/{{ user.stdout }}/keys/{{ domain_name }}.key"
+
+      - name: "Generate Let's Encrypt CSR"
+        shell: "openssl req -new -sha256 -key /home/{{ user.stdout }}/keys/{{ domain_name }}.key -subj \"/CN={{ domain_name }}\" -reqexts SAN -config <(cat /etc/ssl/openssl.cnf <(printf \"\n[SAN]\nsubjectAltName=DNS:{{ domain_name }},{{ contents }}\")) | sudo tee /home/{{ user.stdout }}/csrs/{{ domain_name }}.csr"
+        args:
+          executable: /bin/bash
+
+
+      - name: "Begin Let's Encrypt challenges"
+        letsencrypt:
+          acme_directory: "{{ acme_directory }}"
+          acme_version: "{{ acme_version }}"
+          account_key_src: "{{ letsencrypt_account_key }}"
+          account_email: "{{ acme_email }}"
+          terms_agreed: 1
+          challenge: "{{ acme_challenge_type }}"
+          csr: "{{ letsencrypt_csrs_dir }}/{{ domain_name }}.csr"
+          dest: "{{ letsencrypt_certs_dir }}/{{ domain_name }}.crt"
+          fullchain_dest: "{{ letsencrypt_certs_dir }}/fullchain_{{ domain_name }}.crt"
+          remaining_days: 91
+        register: acme_challenge_afftrac_com
+
+
+      - name: "CURL for domain"
+        shell: "curl 'http://{{ domain_name }}/{{ acme_challenge_afftrac_com['challenge_data'][item]['http-01']['resource'] }}?set_token=1&value={{ acme_challenge_afftrac_com['challenge_data'][item]['http-01']['resource_value'] }}'"
+        with_items:
+        - "{{ domain_name }}"
+
+
+      - name: "CURL for SAN"
+        shell: "curl 'http://{{ item }}/{{ acme_challenge_afftrac_com['challenge_data'][item]['http-01']['resource'] }}?set_token=1&value={{ acme_challenge_afftrac_com['challenge_data'][item]['http-01']['resource_value'] }}'"
+        loop: "{{ lookup('file', '/home/{{ user.stdout }}/f2.txt').splitlines() }}"
+
+
+      - name: "Complete Let's Encrypt challenges"
+        letsencrypt:
+          acme_directory: "{{ acme_directory }}"
+          acme_version: "{{ acme_version }}"
+          account_key_src: "{{ letsencrypt_account_key }}"
+          account_email: "{{ acme_email }}"
+          challenge: "{{ acme_challenge_type }}"
+          csr: "{{ letsencrypt_csrs_dir }}/{{ domain_name }}.csr"
+          dest: "{{ letsencrypt_certs_dir }}/{{ domain_name }}.crt"
+          chain_dest: "{{ letsencrypt_certs_dir }}/chain_{{ domain_name }}.crt"
+          fullchain_dest: "{{ letsencrypt_certs_dir }}/fullchain_{{ domain_name }}"
+          data: "{{ acme_challenge_afftrac_com }}"
+
+
+      - name: "registering value"
+        shell: "name={{ user_input }}-$(date +%s) && echo $name"
+        register: name
+
+
+      - name: "Appending new ssl cert name to the log file"
+        shell: |
+           echo {{ name.stdout }} > /home/{{ user.stdout }}/f8.txt
+      - name: “Uploading cert to GCP"
+        shell: "gcloud beta compute ssl-certificates create {{ name.stdout }} --project=tranquil-apogee-150510 --global --certificate={{ letsencrypt_certs_dir }}/fullchain_{{ domain_name }} --private-key={{ letsencrypt_keys_dir }}/{{ domain_name }}.key"
+        register: cer
+
+
+      - name: "List of attached ssl certificate on target proxy"
+        shell: |
+             echo "******The List of SSL Cert's attached on testing-trackier-target-proxy*******"
+             gcloud beta compute target-https-proxies describe {{ proxy }} | grep {{ user_input }} | awk '/sslCertificates/ {print $0}' | cut -d "/" -f 10
+             echo "------------------------------------------------------------------------------"
+             echo "Old cert:-"{{ removed_ssl }}
+             echo "New cert:-"{{ name.stdout }}
+        register: out
+      - debug: var=out.stdout_lines
+
+
+      - name: "Pause to get some input"
+        ansible.builtin.pause:
+             prompt: "Are you sure to proceed? to update load balancer's with the new SSL cert's [y,n]"
+             echo: yes
+        register: gen
+
+
+      - meta: end_play
+        when: (gen.user_input == "no" or gen.user_input == "n")
+
+
+      - name: "Updating Certificates on GCP target-proxies"
+        shell: |
+             echo "Working on it ......"
+             za=$(gcloud beta compute target-https-proxies describe testing-trackier-lb-target-proxy-2 | awk '/sslCertificates/ {print $0}' | cut -d "/" -f 10 | tail -n +2 | grep -v {{ removed_ssl }})
+             pa=$(echo $za | tr ' ' ',')
+             echo $pa
+             gcloud compute target-https-proxies update {{ item }} --ssl-certificates $pa,{{ name.stdout }}
+        loop: "{{ lookup('file', '/home/{{ user.stdout }}/proxy.txt').splitlines() }}"
+        register: reg
+      - debug: var=reg.stdout_lines
